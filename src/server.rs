@@ -348,6 +348,7 @@ where
         crate::client_registry::ClientInfo::new(client_id, peer_addr.clone());
     client_info.laddr = format!("{}:{}", config.bind, config.port);
     let activity = Arc::clone(&client_info.activity);
+    let query_buffer = Arc::clone(&client_info.query_buffer);
     // `CLIENT REPLY`.
     let mut reply_gate = crate::client_registry::ReplyGate::default();
     client_registry.register(client_info);
@@ -392,7 +393,12 @@ where
     });
 
     // ── Connection state ─────────────────────────────────────────────────
-    let mut buffer = Vec::with_capacity(4096);
+    let mut buffer = Vec::with_capacity(16 * 1024);
+    let mut private_query_buffer = false;
+    query_buffer.update(0, buffer.capacity(), private_query_buffer);
+    let mut last_query_buffer_activity = Instant::now();
+    let mut last_query_buffer_resize_check = Instant::now();
+    let mut query_buffer_peak = 0usize;
     let mut temp = [0u8; 4096];
     let mut read_start = 0usize;
     // How far the request still arriving has been read.
@@ -460,6 +466,21 @@ where
 
     loop {
         if carried.is_empty() {
+            let should_maintain_query_buffer = private_query_buffer
+                && (buffer.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
+                    || buffer.capacity().saturating_sub(buffer.len()) > 4 * 1024);
+            let resize_deadline = if buffer.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
+            {
+                tokio::time::Instant::from_std(
+                    last_query_buffer_resize_check + resp::parse::QUERY_BUFFER_PEAK_SAMPLE_INTERVAL,
+                )
+            } else {
+                tokio::time::Instant::from_std(
+                    last_query_buffer_activity
+                        + resp::parse::QUERY_BUFFER_IDLE_RESIZE_AFTER
+                        + tokio::time::Duration::from_millis(10),
+                )
+            };
             let n = tokio::select! {
                 // Normal case: data arrived from the client
                 result = reader.read(&mut temp) => {
@@ -474,13 +495,49 @@ where
                     // then break. Redis sends no response on kill — we match that.
                     break;
                 }
+                // Redis reclaims private query buffers from its client cron.
+                // Tokio's socket read is cancellation-safe, so this deadline
+                // can be checked without abandoning an in-flight operation.
+                _ = tokio::time::sleep_until(resize_deadline), if should_maintain_query_buffer => {
+                    let resized = resp::parse::resize_private_query_buffer(
+                        &mut buffer,
+                        read_start,
+                        &mut private_query_buffer,
+                        last_query_buffer_activity.elapsed(),
+                        query_buffer_peak,
+                        progress.minimum_capacity(),
+                    );
+                    if resized {
+                        read_start = 0;
+                        query_buffer.update(
+                            buffer.len(),
+                            buffer.capacity().saturating_sub(buffer.len()),
+                            private_query_buffer,
+                        );
+                    }
+                    query_buffer_peak = buffer
+                        .len()
+                        .saturating_sub(read_start)
+                        .max(progress.minimum_capacity());
+                    last_query_buffer_resize_check = Instant::now();
+                    continue;
+                }
             };
+            last_query_buffer_activity = Instant::now();
+            activity.touch();
             crate::stats::TOTAL_NET_INPUT_BYTES
                 .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
             buffer.extend_from_slice(&temp[..n]);
         } else {
             buffer.append(&mut carried);
+            last_query_buffer_activity = Instant::now();
         }
+        query_buffer_peak = query_buffer_peak.max(buffer.len().saturating_sub(read_start));
+        query_buffer.update(
+            buffer.len().saturating_sub(read_start),
+            buffer.capacity().saturating_sub(buffer.len()),
+            private_query_buffer,
+        );
 
         let mut parse_offset = read_start;
         let mut connection_handoff: Option<ConnectionHandoff> = None;
@@ -491,6 +548,8 @@ where
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
+        let query_buffer_bytes = buffer.len();
+        let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
             match progress.next_request(&mut buffer, parse_offset, authenticated_user.is_some()) {
                 Ok(request) => request,
@@ -500,10 +559,15 @@ where
                 }
             }
         {
+            if cmd.iter().any(|arg| arg.len() >= 32 * 1024) {
+                private_query_buffer = true;
+            }
             if cmd.is_empty() {
                 parse_offset += consumed;
+                query_buffer.update_len(query_buffer_bytes.saturating_sub(parse_offset));
                 continue;
             }
+            query_buffer.update_len(query_buffer_bytes.saturating_sub(parse_offset + consumed));
             // ── QUIT ─────────────────────────────────────────────────────────
             // Reply +OK and close the connection. Handled in the connection
             // loop rather than the dispatch table because closing the socket
@@ -2035,6 +2099,20 @@ where
             combined.extend_from_slice(&response);
             parse_offset += consumed;
         }
+        private_query_buffer |= progress.uses_private_query_buffer();
+        let reserve_hint = progress.take_reserve_hint();
+        if private_query_buffer
+            && !was_private_query_buffer
+            && buffer.capacity() < resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY
+        {
+            buffer.reserve(
+                resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(buffer.len()),
+            );
+        }
+        if reserve_hint > buffer.capacity() {
+            buffer.reserve(reserve_hint.saturating_sub(buffer.len()));
+        }
+        query_buffer_peak = query_buffer_peak.max(reserve_hint);
         reply_gate.settle(&mut combined);
         crate::tracking::after_command(
             &tracking_table,
@@ -2065,9 +2143,11 @@ where
         }
         // A buffer that grew to hold one large request is not kept at that
         // size for the life of the connection.
-        if buffer.is_empty() && buffer.capacity() > BIG_BUFFER {
-            buffer = Vec::with_capacity(4096);
-        }
+        query_buffer.update(
+            buffer.len().saturating_sub(read_start),
+            buffer.capacity().saturating_sub(buffer.len()),
+            private_query_buffer,
+        );
 
         // One TCP write per read syscall batch (pipelining).
         if write_tcp_batch(&writer, &mut combined).await.is_err() {

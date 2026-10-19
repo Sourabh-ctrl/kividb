@@ -34,7 +34,10 @@ fn tmp_kdb(tag: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("/tmp/kivi_test_{tag}_{id:?}_{ts}.kdb")
+    std::env::temp_dir()
+        .join(format!("kivi_test_{tag}_{id:?}_{ts}.kdb"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn tmp_rdb(tag: &str) -> String {
@@ -43,7 +46,10 @@ fn tmp_rdb(tag: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("/tmp/kivi_test_{tag}_{id:?}_{ts}.rdb")
+    std::env::temp_dir()
+        .join(format!("kivi_test_{tag}_{id:?}_{ts}.rdb"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Write `maps` to a KDB file, load it back, return the loaded db 0.

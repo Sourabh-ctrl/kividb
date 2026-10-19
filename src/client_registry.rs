@@ -34,6 +34,9 @@ pub struct Activity {
     sub: [AtomicU64; 2],
     /// The two lengths.
     lens: AtomicU64,
+    /// Wall-clock seconds of the last successful client read, as Redis uses
+    /// for CLIENT LIST's idle field.
+    last_interaction: AtomicU64,
     db: std::sync::atomic::AtomicUsize,
     /// What is to be written to the connection after the reply to the
     /// command it is running: a message that command gave rise to, for this
@@ -43,6 +46,44 @@ pub struct Activity {
     /// The connection has killed itself (`CLIENT KILL … SKIPME no`): it is
     /// to be closed, but not before the reply to that command is written.
     closing_after_reply: std::sync::atomic::AtomicBool,
+}
+
+/// A connection's current RESP query buffer, published without taking the
+/// registry lock. `free` is the spare capacity at the end of the backing Vec.
+#[derive(Debug, Default)]
+pub struct QueryBufferMetrics {
+    len: AtomicU64,
+    free: AtomicU64,
+    private: std::sync::atomic::AtomicBool,
+}
+
+impl QueryBufferMetrics {
+    #[inline]
+    pub fn update(&self, len: usize, free: usize, private: bool) {
+        self.len.store(len as u64, Ordering::Relaxed);
+        self.free.store(free as u64, Ordering::Relaxed);
+        self.private.store(private, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn update_len(&self, len: usize) {
+        self.len.store(len as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn values(&self) -> (u64, u64) {
+        let len = self.len.load(Ordering::Relaxed);
+        // Redis reports qbuf-free as zero when a client has no query buffer
+        // (ordinary idle clients use the reusable thread-local buffer).
+        // An empty private buffer remains visible until it is reused or
+        // released. Ordinary clients with no private buffer report 0/0.
+        let free = if self.private.load(Ordering::Relaxed) {
+            self.free.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        (len, free)
+    }
 }
 
 /// `CLIENT REPLY ON | OFF | SKIP`, as the connection loop keeps it.
@@ -257,6 +298,22 @@ fn unpack<const N: usize>(from: &[AtomicU64; N], len: usize) -> String {
 }
 
 impl Activity {
+    fn now_seconds() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    pub fn touch(&self) {
+        self.last_interaction
+            .store(Self::now_seconds(), Ordering::Relaxed);
+    }
+
+    fn idle_seconds(&self) -> u64 {
+        Self::now_seconds().saturating_sub(self.last_interaction.load(Ordering::Relaxed))
+    }
+
     /// See [`Activity::closing_after_reply`].
     pub fn closes_after_reply(&self) -> bool {
         self.closing_after_reply.load(Ordering::Relaxed)
@@ -323,6 +380,7 @@ pub struct ClientInfo {
     pub flags: String,
     pub connected_at: Instant,
     pub activity: Arc<Activity>,
+    pub query_buffer: Arc<QueryBufferMetrics>,
     pub no_evict: bool,
     /// True iff the client has issued ASKING for the next command.
     /// Single-shot: cleared after the next command runs (whatever the result).
@@ -382,7 +440,11 @@ impl ClientInfo {
             db: 0,
             flags: "N".to_string(),
             connected_at: Instant::now(),
-            activity: Arc::default(),
+            activity: Arc::new(Activity {
+                last_interaction: AtomicU64::new(Activity::now_seconds()),
+                ..Activity::default()
+            }),
+            query_buffer: Arc::default(),
             no_evict: false,
             asking: false,
             readonly: false,
@@ -420,11 +482,12 @@ impl ClientInfo {
         }
     }
 
-    /// One line of `CLIENT LIST`, in Redis's layout. The fields that count
-    /// buffers and memory (`qbuf`, `rbs`, `tot-mem`, …) describe how Redis
-    /// holds a connection; nothing here corresponds, and they are zero.
+    /// One line of `CLIENT LIST`, in Redis's layout. Query-buffer counters
+    /// describe RESP bytes awaiting parsing and spare Vec capacity; other
+    /// Redis-specific buffer and memory counters remain zero.
     pub fn to_list_line(&self) -> String {
         let age = self.connected_at.elapsed().as_secs();
+        let (qbuf, qbuf_free) = self.query_buffer.values();
         let mut flags = String::new();
         if self.flags != "N" {
             flags.push_str(&self.flags);
@@ -439,8 +502,8 @@ impl ClientInfo {
             flags.push('N');
         }
         format!(
-            "id={} addr={} laddr={} fd=0 name={} age={} idle=0 flags={} db={} sub={} psub={} \
-            ssub={} multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
+            "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} \
+            ssub={} multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
             rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0\n",
             self.id,
@@ -448,11 +511,14 @@ impl ClientInfo {
             self.laddr,
             self.name,
             age,
+            self.activity.idle_seconds(),
             flags,
             self.activity.db(),
             self.subscriptions[0],
             self.subscriptions[1],
             self.subscriptions[2],
+            qbuf,
+            qbuf_free,
             self.activity.last_cmd(),
             self.user,
             self.tracking_redirect.map_or(-1, |id| id as i64),
@@ -585,6 +651,7 @@ impl ClientRegistryInner {
                 flags: c.flags.clone(),
                 connected_at: c.connected_at,
                 activity: Arc::clone(&c.activity),
+                query_buffer: Arc::clone(&c.query_buffer),
                 no_evict: c.no_evict,
                 asking: c.asking,
                 readonly: c.readonly,
@@ -621,6 +688,7 @@ impl ClientRegistryInner {
             flags: c.flags.clone(),
             connected_at: c.connected_at,
             activity: Arc::clone(&c.activity),
+            query_buffer: Arc::clone(&c.query_buffer),
             no_evict: c.no_evict,
             asking: c.asking,
             readonly: c.readonly,

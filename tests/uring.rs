@@ -228,6 +228,230 @@ fn the_server_is_running_on_io_uring() {
     assert!(!log.contains("io_uring unavailable"), "{log}");
 }
 
+fn client_list_line<'a>(list: &'a V, identity: &str) -> Option<&'a str> {
+    let V::Str(list) = list else {
+        panic!("CLIENT LIST did not return a string: {list:?}");
+    };
+    list.lines().find(|line| line.contains(identity))
+}
+
+fn client_metric<'a>(line: &'a str, metric: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(metric))
+}
+
+/// The generic integration tests start the library's Tokio server. This test
+/// starts the binary with `--io-model uring` and verifies the query-buffer
+/// metrics in that separate connection loop.
+#[test]
+fn query_buffer_metrics_track_partial_and_completed_commands() {
+    let server = Server::start();
+    let log = std::fs::read_to_string(server.dir.join("server.log")).unwrap();
+    assert!(log.contains("I/O model      : io_uring"), "{log}");
+    let mut partial = server.conn();
+    let mut observer = server.conn();
+    let partial_addr = format!("addr={}", partial.writer.local_addr().unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let idle_line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, &partial_addr).unwrap_or("");
+        if client_metric(line, "qbuf-free=").is_some() || Instant::now() >= deadline {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(client_metric(&idle_line, "qbuf="), Some("0"), "{idle_line}");
+    assert_eq!(
+        client_metric(&idle_line, "qbuf-free="),
+        Some("0"),
+        "{idle_line}"
+    );
+
+    // CLIENT INFO reports the caller's own metrics. Its request has already
+    // been parsed before the command formats the response.
+    let info = partial.cmd(&["CLIENT", "INFO"]);
+    let V::Str(info) = info else {
+        panic!("CLIENT INFO did not return a string: {info:?}");
+    };
+    assert_eq!(client_metric(&info, "qbuf="), Some("0"), "{info}");
+    assert_eq!(client_metric(&info, "qbuf-free="), Some("0"), "{info}");
+    assert_eq!(partial.cmd(&["CLIENT", "SETNAME", "uring-qbuf"]), s("OK"));
+
+    // The first 14 bytes are a complete PING. The next 10 bytes are an
+    // incomplete PING, ending partway through its bulk string. Consuming the
+    // first request leaves less than half the buffer, exercising compaction.
+    partial
+        .writer
+        .write_all(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPI")
+        .unwrap();
+    assert_eq!(partial.read(), s("PONG"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let first_partial_line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
+        if client_metric(line, "qbuf=") == Some("10") || Instant::now() >= deadline {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        client_metric(&first_partial_line, "qbuf="),
+        Some("10"),
+        "{first_partial_line}"
+    );
+    assert_eq!(
+        client_metric(&first_partial_line, "qbuf-free="),
+        Some("16374"),
+        "{first_partial_line}"
+    );
+
+    // Complete the bulk string but leave its trailing CRLF outstanding.
+    partial.writer.write_all(b"NG").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let partial_line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
+        if client_metric(line, "qbuf=") == Some("12") || Instant::now() >= deadline {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        client_metric(&partial_line, "qbuf="),
+        Some("12"),
+        "{partial_line}"
+    );
+    assert_eq!(
+        client_metric(&partial_line, "qbuf-free="),
+        Some("16372"),
+        "{partial_line}"
+    );
+
+    partial.writer.write_all(b"\r\n").unwrap();
+    assert_eq!(partial.read(), s("PONG"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let completed_line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
+        if client_metric(line, "qbuf=") == Some("0") || Instant::now() >= deadline {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        client_metric(&completed_line, "qbuf="),
+        Some("0"),
+        "{completed_line}"
+    );
+    assert_eq!(
+        client_metric(&completed_line, "qbuf-free="),
+        Some("16384"),
+        "{completed_line}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let resized_line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
+        if client_metric(line, "qbuf-free=") == Some("0") || Instant::now() >= deadline {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        client_metric(&resized_line, "qbuf="),
+        Some("0"),
+        "{resized_line}"
+    );
+    assert_eq!(
+        client_metric(&resized_line, "qbuf-free="),
+        Some("0"),
+        "idle private query buffer was not released: {resized_line}"
+    );
+
+    let info = partial.cmd(&["CLIENT", "INFO"]);
+    let V::Str(info) = info else {
+        panic!("CLIENT INFO did not return a string: {info:?}");
+    };
+    assert_eq!(client_metric(&info, "qbuf="), Some("0"), "{info}");
+    assert_eq!(client_metric(&info, "qbuf-free="), Some("0"), "{info}");
+}
+
+fn client_query_buffer_size(line: &str) -> Option<usize> {
+    let qbuf = client_metric(line, "qbuf=")?.parse::<usize>().ok()?;
+    let free = client_metric(line, "qbuf-free=")?.parse::<usize>().ok()?;
+    Some(qbuf + free)
+}
+
+#[test]
+fn large_bulk_header_reserves_a_private_query_buffer() {
+    let server = Server::start();
+    let mut client = server.conn();
+    let mut observer = server.conn();
+    assert_eq!(
+        client.cmd(&["CLIENT", "SETNAME", "uring-fat-qbuf"]),
+        s("OK")
+    );
+
+    client
+        .writer
+        .write_all(b"*3\r\n$3\r\nset\r\n$1\r\na\r\n$1000000\r\n")
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-fat-qbuf").unwrap_or("");
+        if client_query_buffer_size(line).is_some_and(|size| size > 1_000_000)
+            || Instant::now() >= deadline
+        {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        client_query_buffer_size(&line).is_some_and(|size| size > 1_000_000),
+        "declared fat argument did not reserve private query-buffer capacity: {line}"
+    );
+
+    client.writer.write_all(b"a").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-fat-qbuf").unwrap_or("");
+        if client_query_buffer_size(line).is_some_and(|size| size > 1_000_000)
+            || Instant::now() >= deadline
+        {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        client_query_buffer_size(&line).is_some_and(|size| size > 1_000_000),
+        "partial fat argument lost its private query-buffer capacity: {line}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let line = loop {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        let line = client_list_line(&list, "name=uring-fat-qbuf").unwrap_or("");
+        if client_query_buffer_size(line).is_some_and(|size| size < 1_000_000)
+            || Instant::now() >= deadline
+        {
+            break line.to_string();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(client_metric(&line, "qbuf="), Some("31"), "{line}");
+    assert!(
+        client_query_buffer_size(&line).is_some_and(|size| size < 1_000_000),
+        "idle partial argument retained excess query-buffer capacity: {line}"
+    );
+}
+
 /// The workers share their port with SO_REUSEPORT, so a second server on the
 /// same port used to start, report itself ready, and take a share of the
 /// first one's clients. It refuses to start, and says why.

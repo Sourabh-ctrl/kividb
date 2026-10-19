@@ -10,7 +10,6 @@ use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio_uring::buf::BoundedBuf;
 use tokio_uring::net::TcpStream;
 
 /// Called when a replica sends PSYNC on the io_uring path.
@@ -462,11 +461,9 @@ fn exec_fast_apply_sets(
 /// empty, rather than kept.
 const BIG_BUFFER: usize = 256 * 1024;
 
-/// What a connection's read buffer starts at, and grows by: what the two
-/// buffers it replaces (one to read into, one to parse from) came to.
-const READ_BUFFER: usize = 32 * 1024;
-/// A read is not started with less room than this.
-const READ_MIN: usize = 8 * 1024;
+/// Scratch space for one socket read. The RESP parse buffer grows separately
+/// and can therefore be resized while an io_uring read remains in flight.
+const READ_BUFFER: usize = 16 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
@@ -509,6 +506,7 @@ pub async fn handle_client(
         crate::client_registry::ClientInfo::new(client_id, peer_addr.clone());
     client_info.laddr = format!("{}:{}", config.bind, config.port);
     let activity = Arc::clone(&client_info.activity);
+    let query_buffer = Arc::clone(&client_info.query_buffer);
     // `CLIENT REPLY`.
     let mut reply_gate = crate::client_registry::ReplyGate::default();
     client_registry.register(client_info);
@@ -534,9 +532,16 @@ pub async fn handle_client(
     };
 
     // ── Connection state ─────────────────────────────────────────────────
-    // What the client sends is read straight into the end of `parse_buf`:
-    // there is no buffer in between to copy it out of.
-    let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER);
+    // Keep socket reads in a separate owned buffer so `parse_buf` can be
+    // resized while an io_uring read is in flight (that read cannot be
+    // cancelled safely).
+    let mut parse_buf: Vec<u8> = Vec::new();
+    let mut read_buf = vec![0u8; READ_BUFFER];
+    let mut private_query_buffer = false;
+    let mut last_query_buffer_activity = Instant::now();
+    let mut last_query_buffer_resize_check = Instant::now();
+    let mut query_buffer_peak = 0usize;
+    query_buffer.update(0, 0, private_query_buffer);
     let mut parse_start = 0usize;
     // How far the request still arriving has been read.
     let mut progress = resp::parse::Progress::default();
@@ -702,16 +707,62 @@ pub async fn handle_client(
         // No `kill_rx` check here any more — the watcher task above shuts the
         // socket down, so a kill surfaces as `Ok(0)` from the read below even
         // when the client is idle.
-        // Room for a read of a useful size after whatever is still waiting
-        // to be parsed (the first part of a request that has not all
-        // arrived). The kernel writes into the spare capacity, and the
-        // buffer comes back that much longer.
-        if parse_buf.capacity() - parse_buf.len() < READ_MIN {
-            parse_buf.reserve(READ_BUFFER);
-        }
-        let unparsed = parse_buf.len();
-        let (res, buf) = stream.read(parse_buf.slice(unparsed..)).await;
-        parse_buf = buf.into_inner();
+        let mut unparsed = parse_buf.len();
+        let (res, returned_read_buf) = {
+            let read = stream.read(read_buf);
+            tokio::pin!(read);
+            loop {
+                let should_maintain_query_buffer = private_query_buffer
+                    && (parse_buf.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
+                        || parse_buf.capacity().saturating_sub(parse_buf.len()) > 4 * 1024);
+                let resize_deadline =
+                    if parse_buf.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD {
+                        tokio::time::Instant::from_std(
+                            last_query_buffer_resize_check
+                                + resp::parse::QUERY_BUFFER_PEAK_SAMPLE_INTERVAL,
+                        )
+                    } else {
+                        tokio::time::Instant::from_std(
+                            last_query_buffer_activity
+                                + resp::parse::QUERY_BUFFER_IDLE_RESIZE_AFTER
+                                + tokio::time::Duration::from_millis(10),
+                        )
+                    };
+                tokio::select! {
+                    result = &mut read => break result,
+                    // Keep the submitted io_uring read alive while trimming the
+                    // separate parser buffer. Cancelling a tokio-uring read would
+                    // strand its owned kernel buffer until completion.
+                    _ = tokio::time::sleep_until(resize_deadline), if should_maintain_query_buffer => {
+                        let resized = resp::parse::resize_private_query_buffer(
+                            &mut parse_buf,
+                            parse_start,
+                            &mut private_query_buffer,
+                            last_query_buffer_activity.elapsed(),
+                            query_buffer_peak,
+                            progress.minimum_capacity(),
+                        );
+                        if resized {
+                            parse_start = 0;
+                            // The pending read owns `read_buf`, but this
+                            // parser buffer may have been compacted meanwhile.
+                            unparsed = parse_buf.len();
+                            query_buffer.update(
+                                parse_buf.len(),
+                                parse_buf.capacity().saturating_sub(parse_buf.len()),
+                                private_query_buffer,
+                            );
+                        }
+                        query_buffer_peak = parse_buf
+                            .len()
+                            .saturating_sub(parse_start)
+                            .max(progress.minimum_capacity());
+                        last_query_buffer_resize_check = Instant::now();
+                    }
+                }
+            }
+        };
+        read_buf = returned_read_buf;
 
         let n = match res {
             Ok(0) => break,
@@ -722,10 +773,19 @@ pub async fn handle_client(
                 break;
             }
         };
+        last_query_buffer_activity = Instant::now();
+        activity.touch();
         crate::stats::TOTAL_NET_INPUT_BYTES
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
+        parse_buf.extend_from_slice(&read_buf[..n]);
+        query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
         debug_assert_eq!(parse_buf.len(), unparsed + n);
+        query_buffer.update(
+            parse_buf.len().saturating_sub(parse_start),
+            parse_buf.capacity().saturating_sub(parse_buf.len()),
+            private_query_buffer,
+        );
 
         let mut parse_offset = parse_start;
         let mut connection_handoff: Option<ConnectionHandoff> = None;
@@ -736,6 +796,8 @@ pub async fn handle_client(
 
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
+        let query_buffer_bytes = parse_buf.len();
+        let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
             match progress.next_request(&mut parse_buf, parse_offset, authenticated_user.is_some())
             {
@@ -746,10 +808,15 @@ pub async fn handle_client(
                 }
             }
         {
+            if cmd.iter().any(|arg| arg.len() >= 32 * 1024) {
+                private_query_buffer = true;
+            }
             if cmd.is_empty() {
                 parse_offset += consumed;
+                query_buffer.update_len(query_buffer_bytes.saturating_sub(parse_offset));
                 continue;
             }
+            query_buffer.update_len(query_buffer_bytes.saturating_sub(parse_offset + consumed));
             // Re-read every command: CONFIG SET appendonly yes must take effect
             // on this connection, not only on ones accepted after the toggle.
             // Tokio's loop already loads AOF_ENABLED per command; this parameter
@@ -2274,6 +2341,20 @@ pub async fn handle_client(
             out_buf.extend_from_slice(&response);
             parse_offset += consumed;
         }
+        private_query_buffer |= progress.uses_private_query_buffer();
+        let reserve_hint = progress.take_reserve_hint();
+        if private_query_buffer
+            && !was_private_query_buffer
+            && parse_buf.capacity() < resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY
+        {
+            parse_buf.reserve(
+                resp::parse::PRIVATE_QUERY_BUFFER_MIN_CAPACITY.saturating_sub(parse_buf.len()),
+            );
+        }
+        if reserve_hint > parse_buf.capacity() {
+            parse_buf.reserve(reserve_hint.saturating_sub(parse_buf.len()));
+        }
+        query_buffer_peak = query_buffer_peak.max(reserve_hint);
         reply_gate.settle(&mut out_buf);
         crate::tracking::after_command(
             &tracking_table,
@@ -2298,17 +2379,17 @@ pub async fn handle_client(
         if parse_start == parse_buf.len() {
             parse_buf.clear();
             parse_start = 0;
-            // A buffer that grew to hold one large request is not kept at
-            // that size for the life of the connection.
-            if parse_buf.capacity() > BIG_BUFFER {
-                parse_buf = Vec::with_capacity(READ_BUFFER);
-            }
         } else if parse_start > 0 && parse_start > parse_buf.len() / 2 {
             let remaining = parse_buf.len() - parse_start;
             parse_buf.copy_within(parse_start.., 0);
             parse_buf.truncate(remaining);
             parse_start = 0;
         }
+        query_buffer.update(
+            parse_buf.len().saturating_sub(parse_start),
+            parse_buf.capacity().saturating_sub(parse_buf.len()),
+            private_query_buffer,
+        );
 
         // Flush output — swap with spare to avoid malloc/free per write cycle.
         // Pushes are no longer drained here; the forwarder task owns them, so
