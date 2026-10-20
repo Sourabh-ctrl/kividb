@@ -34,9 +34,6 @@ pub struct Activity {
     sub: [AtomicU64; 2],
     /// The two lengths.
     lens: AtomicU64,
-    /// Wall-clock seconds of the last successful client read, as Redis uses
-    /// for CLIENT LIST's idle field.
-    last_interaction: AtomicU64,
     db: std::sync::atomic::AtomicUsize,
     /// What is to be written to the connection after the reply to the
     /// command it is running: a message that command gave rise to, for this
@@ -52,37 +49,27 @@ pub struct Activity {
 /// registry lock. `free` is the spare capacity at the end of the backing Vec.
 #[derive(Debug, Default)]
 pub struct QueryBufferMetrics {
-    len: AtomicU64,
-    free: AtomicU64,
-    private: std::sync::atomic::AtomicBool,
+    /// The high and low halves hold qbuf and qbuf-free. Redis's maximum query
+    /// buffer is below 2 GiB, so each value fits in 32 bits.
+    values: AtomicU64,
 }
 
 impl QueryBufferMetrics {
     #[inline]
     pub fn update(&self, len: usize, free: usize, private: bool) {
-        self.len.store(len as u64, Ordering::Relaxed);
-        self.free.store(free as u64, Ordering::Relaxed);
-        self.private.store(private, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn update_len(&self, len: usize) {
-        self.len.store(len as u64, Ordering::Relaxed);
+        let len = len.min(u32::MAX as usize) as u64;
+        let free = if private {
+            free.min(u32::MAX as usize) as u64
+        } else {
+            0
+        };
+        self.values.store((len << 32) | free, Ordering::Relaxed);
     }
 
     #[inline]
     fn values(&self) -> (u64, u64) {
-        let len = self.len.load(Ordering::Relaxed);
-        // Redis reports qbuf-free as zero when a client has no query buffer
-        // (ordinary idle clients use the reusable thread-local buffer).
-        // An empty private buffer remains visible until it is reused or
-        // released. Ordinary clients with no private buffer report 0/0.
-        let free = if self.private.load(Ordering::Relaxed) {
-            self.free.load(Ordering::Relaxed)
-        } else {
-            0
-        };
-        (len, free)
+        let values = self.values.load(Ordering::Relaxed);
+        (values >> 32, values & u32::MAX as u64)
     }
 }
 
@@ -298,22 +285,6 @@ fn unpack<const N: usize>(from: &[AtomicU64; N], len: usize) -> String {
 }
 
 impl Activity {
-    fn now_seconds() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-    }
-
-    pub fn touch(&self) {
-        self.last_interaction
-            .store(Self::now_seconds(), Ordering::Relaxed);
-    }
-
-    fn idle_seconds(&self) -> u64 {
-        Self::now_seconds().saturating_sub(self.last_interaction.load(Ordering::Relaxed))
-    }
-
     /// See [`Activity::closing_after_reply`].
     pub fn closes_after_reply(&self) -> bool {
         self.closing_after_reply.load(Ordering::Relaxed)
@@ -440,10 +411,7 @@ impl ClientInfo {
             db: 0,
             flags: "N".to_string(),
             connected_at: Instant::now(),
-            activity: Arc::new(Activity {
-                last_interaction: AtomicU64::new(Activity::now_seconds()),
-                ..Activity::default()
-            }),
+            activity: Arc::default(),
             query_buffer: Arc::default(),
             no_evict: false,
             asking: false,
@@ -502,7 +470,7 @@ impl ClientInfo {
             flags.push('N');
         }
         format!(
-            "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} \
+            "id={} addr={} laddr={} fd=0 name={} age={} idle=0 flags={} db={} sub={} psub={} \
             ssub={} multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
             rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0\n",
@@ -511,7 +479,6 @@ impl ClientInfo {
             self.laddr,
             self.name,
             age,
-            self.activity.idle_seconds(),
             flags,
             self.activity.db(),
             self.subscriptions[0],

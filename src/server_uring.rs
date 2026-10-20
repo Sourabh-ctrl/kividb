@@ -10,6 +10,7 @@ use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_uring::buf::BoundedBuf;
 use tokio_uring::net::TcpStream;
 
 /// Called when a replica sends PSYNC on the io_uring path.
@@ -461,9 +462,8 @@ fn exec_fast_apply_sets(
 /// empty, rather than kept.
 const BIG_BUFFER: usize = 256 * 1024;
 
-/// Scratch space for one socket read. The RESP parse buffer grows separately
-/// and can therefore be resized while an io_uring read remains in flight.
 const READ_BUFFER: usize = 16 * 1024;
+const READ_MIN: usize = 8 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
@@ -532,14 +532,11 @@ pub async fn handle_client(
     };
 
     // ── Connection state ─────────────────────────────────────────────────
-    // Keep socket reads in a separate owned buffer so `parse_buf` can be
-    // resized while an io_uring read is in flight (that read cannot be
-    // cancelled safely).
-    let mut parse_buf: Vec<u8> = Vec::new();
-    let mut read_buf = vec![0u8; READ_BUFFER];
+    let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER);
     let mut private_query_buffer = false;
     let mut last_query_buffer_activity = Instant::now();
-    let mut last_query_buffer_resize_check = Instant::now();
+    let query_buffer_idle_resize_after =
+        std::time::Duration::from_millis(config.query_buffer_idle_resize_after_ms);
     let mut query_buffer_peak = 0usize;
     query_buffer.update(0, 0, private_query_buffer);
     let mut parse_start = 0usize;
@@ -704,65 +701,29 @@ pub async fn handle_client(
     let mut lua_env: Option<crate::lua_vm_blocking::ClientExecEnv> = None;
 
     loop {
+        let was_private_at_read = private_query_buffer;
         // No `kill_rx` check here any more — the watcher task above shuts the
         // socket down, so a kill surfaces as `Ok(0)` from the read below even
         // when the client is idle.
-        let mut unparsed = parse_buf.len();
-        let (res, returned_read_buf) = {
-            let read = stream.read(read_buf);
-            tokio::pin!(read);
-            loop {
-                let should_maintain_query_buffer = private_query_buffer
-                    && (parse_buf.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
-                        || parse_buf.capacity().saturating_sub(parse_buf.len()) > 4 * 1024);
-                let resize_deadline =
-                    if parse_buf.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD {
-                        tokio::time::Instant::from_std(
-                            last_query_buffer_resize_check
-                                + resp::parse::QUERY_BUFFER_PEAK_SAMPLE_INTERVAL,
-                        )
-                    } else {
-                        tokio::time::Instant::from_std(
-                            last_query_buffer_activity
-                                + resp::parse::QUERY_BUFFER_IDLE_RESIZE_AFTER
-                                + tokio::time::Duration::from_millis(10),
-                        )
-                    };
-                tokio::select! {
-                    result = &mut read => break result,
-                    // Keep the submitted io_uring read alive while trimming the
-                    // separate parser buffer. Cancelling a tokio-uring read would
-                    // strand its owned kernel buffer until completion.
-                    _ = tokio::time::sleep_until(resize_deadline), if should_maintain_query_buffer => {
-                        let resized = resp::parse::resize_private_query_buffer(
-                            &mut parse_buf,
-                            parse_start,
-                            &mut private_query_buffer,
-                            last_query_buffer_activity.elapsed(),
-                            query_buffer_peak,
-                            progress.minimum_capacity(),
-                        );
-                        if resized {
-                            parse_start = 0;
-                            // The pending read owns `read_buf`, but this
-                            // parser buffer may have been compacted meanwhile.
-                            unparsed = parse_buf.len();
-                            query_buffer.update(
-                                parse_buf.len(),
-                                parse_buf.capacity().saturating_sub(parse_buf.len()),
-                                private_query_buffer,
-                            );
-                        }
-                        query_buffer_peak = parse_buf
-                            .len()
-                            .saturating_sub(parse_start)
-                            .max(progress.minimum_capacity());
-                        last_query_buffer_resize_check = Instant::now();
-                    }
-                }
-            }
-        };
-        read_buf = returned_read_buf;
+        //
+        // The read is never raced. tokio_uring cannot cancel an in-flight op,
+        // so a losing `select!` arm would leak the buffer it owns until the
+        // kernel completes it (see the note above). Reading straight into
+        // `parse_buf` — the same zero-copy path an ordinary client uses — keeps
+        // the buffer owned by this loop for exactly the duration of the read.
+        // Query-buffer shrinking therefore happens *between* batches: right
+        // after a read completes (the buffer is then owned by this loop, with
+        // no operation in flight), before the next read is submitted. An idle
+        // client whose oversized buffer is not followed by another read keeps
+        // that buffer until the next read opportunity; that is the accepted
+        // io_uring tradeoff for not racing the read (Redis shrinks such buffers
+        // from its client cron instead).
+        if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
+            parse_buf.reserve(READ_BUFFER);
+        }
+        let unparsed = parse_buf.len();
+        let (res, buffer) = stream.read(parse_buf.slice(unparsed..)).await;
+        parse_buf = buffer.into_inner();
 
         let n = match res {
             Ok(0) => break,
@@ -773,12 +734,42 @@ pub async fn handle_client(
                 break;
             }
         };
-        last_query_buffer_activity = Instant::now();
-        activity.touch();
+        // Between batches, before the activity timestamp is refreshed: if this
+        // client was idle for long enough, reclaim an oversized private buffer
+        // now. No read is in flight, so rebuilding `parse_buf` is safe.
+        //
+        // Only buffers past the resize threshold can be reclaimed, so the
+        // clock is read only for those; an ordinary client — whose buffer is
+        // the small initial one — pays nothing. This keeps `SET`/`GET` at the
+        // floor from a `clock_gettime` on every read.
+        if private_query_buffer
+            && parse_buf.capacity() > resp::parse::QUERY_BUFFER_RESIZE_THRESHOLD
+            && parse_buf.capacity().saturating_sub(parse_buf.len())
+                > resp::parse::QUERY_BUFFER_MIN_SPARE_FOR_RESIZE
+        {
+            let resized = resp::parse::resize_private_query_buffer_after(
+                &mut parse_buf,
+                parse_start,
+                &mut private_query_buffer,
+                last_query_buffer_activity.elapsed(),
+                query_buffer_idle_resize_after,
+                query_buffer_peak,
+                progress.minimum_capacity(),
+            );
+            if resized {
+                parse_start = 0;
+            }
+            query_buffer_peak = parse_buf
+                .len()
+                .saturating_sub(parse_start)
+                .max(progress.minimum_capacity());
+        }
+        if was_private_at_read {
+            last_query_buffer_activity = Instant::now();
+        }
         crate::stats::TOTAL_NET_INPUT_BYTES
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
 
-        parse_buf.extend_from_slice(&read_buf[..n]);
         query_buffer_peak = query_buffer_peak.max(parse_buf.len().saturating_sub(parse_start));
         debug_assert_eq!(parse_buf.len(), unparsed + n);
         query_buffer.update(
@@ -797,6 +788,7 @@ pub async fn handle_client(
         // What the client sent that no request can begin with, if it did.
         let mut protocol_error: Option<String> = None;
         let query_buffer_bytes = parse_buf.len();
+        let query_buffer_free = parse_buf.capacity().saturating_sub(parse_buf.len());
         let was_private_query_buffer = private_query_buffer;
         while let Some((consumed, cmd)) =
             match progress.next_request(&mut parse_buf, parse_offset, authenticated_user.is_some())
@@ -808,15 +800,21 @@ pub async fn handle_client(
                 }
             }
         {
-            if cmd.iter().any(|arg| arg.len() >= 32 * 1024) {
-                private_query_buffer = true;
-            }
+            private_query_buffer |= progress.take_private_query_buffer();
             if cmd.is_empty() {
                 parse_offset += consumed;
-                query_buffer.update_len(query_buffer_bytes.saturating_sub(parse_offset));
+                query_buffer.update(
+                    query_buffer_bytes.saturating_sub(parse_offset),
+                    query_buffer_free,
+                    private_query_buffer,
+                );
                 continue;
             }
-            query_buffer.update_len(query_buffer_bytes.saturating_sub(parse_offset + consumed));
+            query_buffer.update(
+                query_buffer_bytes.saturating_sub(parse_offset + consumed),
+                query_buffer_free,
+                private_query_buffer,
+            );
             // Re-read every command: CONFIG SET appendonly yes must take effect
             // on this connection, not only on ones accepted after the toggle.
             // Tokio's loop already loads AOF_ENABLED per command; this parameter
@@ -2341,7 +2339,10 @@ pub async fn handle_client(
             out_buf.extend_from_slice(&response);
             parse_offset += consumed;
         }
-        private_query_buffer |= progress.uses_private_query_buffer();
+        private_query_buffer |= progress.take_private_query_buffer();
+        if private_query_buffer && !was_private_query_buffer {
+            last_query_buffer_activity = Instant::now();
+        }
         let reserve_hint = progress.take_reserve_hint();
         if private_query_buffer
             && !was_private_query_buffer

@@ -183,6 +183,15 @@ does.
   `--tls-port`.
 * In cluster mode a `MULTI` is routed as its commands are queued and must
   address one slot.
+* **An idle client's oversized query buffer is released later under
+  io_uring.** `CLIENT LIST`'s `qbuf` and `qbuf-free` are reported truthfully
+  on both servers, but the io_uring server does not shrink an idle buffer from
+  a background timer: it cannot rebuild a buffer a read owns, and it will not
+  cancel the read to force one, so it reclaims the buffer at the client's next
+  read instead. Redis — and KiviDB's own Tokio server, whose reads are
+  cancellable — shrink it from a two-second idle timer. The buffer is still
+  released, only later; see `docs/REDIS_TEST_SUITE.md` and the `unit/querybuf`
+  failures.
 
 ## Fixed along the way
 

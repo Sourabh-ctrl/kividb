@@ -186,6 +186,8 @@ impl Server {
                 "uring",
                 "--threads",
                 "4",
+                "--query-buffer-idle-resize-after-ms",
+                "150",
                 "--configfile",
                 "kividb.conf",
             ])
@@ -352,24 +354,48 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
         "{completed_line}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let resized_line = loop {
+    // io_uring reclaims an oversized private query buffer *between* reads, not
+    // while a read is in flight; but this buffer only reached the 16 KiB floor,
+    // which is never reclaimed. Wait past the idle threshold and confirm the
+    // floor is held, then send a command and confirm it is still held.
+    std::thread::sleep(Duration::from_secs(3));
+    let idle_line = {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        client_list_line(&list, "name=uring-qbuf")
+            .unwrap_or("")
+            .to_string()
+    };
+    assert_eq!(
+        client_metric(&idle_line, "qbuf-free="),
+        Some("16384"),
+        "an idle io_uring client must retain its private query buffer until the next read: {idle_line}"
+    );
+
+    // A private buffer that only ever reached the 16 KiB floor is never
+    // reclaimed: like Redis, io_uring keeps buffers at or below
+    // `PROTO_RESIZE_THRESHOLD` (32 KiB) untouched, so the floor survives an
+    // idle period and the read that follows it. (Reclaiming an *oversized*
+    // buffer is the next test's subject.)
+    assert_eq!(partial.cmd(&["PING"]), s("PONG"));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let floor_line = loop {
         let list = observer.cmd(&["CLIENT", "LIST"]);
         let line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
-        if client_metric(line, "qbuf-free=") == Some("0") || Instant::now() >= deadline {
+        if client_metric(line, "qbuf=") == Some("0") || Instant::now() >= deadline {
             break line.to_string();
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(
-        client_metric(&resized_line, "qbuf="),
+        client_metric(&floor_line, "qbuf="),
         Some("0"),
-        "{resized_line}"
+        "{floor_line}"
     );
     assert_eq!(
-        client_metric(&resized_line, "qbuf-free="),
-        Some("0"),
-        "idle private query buffer was not released: {resized_line}"
+        client_metric(&floor_line, "qbuf-free="),
+        Some("16384"),
+        "the 16 KiB floor must be retained across reads: {floor_line}"
     );
 
     let info = partial.cmd(&["CLIENT", "INFO"]);
@@ -377,7 +403,6 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
         panic!("CLIENT INFO did not return a string: {info:?}");
     };
     assert_eq!(client_metric(&info, "qbuf="), Some("0"), "{info}");
-    assert_eq!(client_metric(&info, "qbuf-free="), Some("0"), "{info}");
 }
 
 fn client_query_buffer_size(line: &str) -> Option<usize> {
@@ -434,6 +459,37 @@ fn large_bulk_header_reserves_a_private_query_buffer() {
         "partial fat argument lost its private query-buffer capacity: {line}"
     );
 
+    // io_uring shrinks an oversized private query buffer *between* reads, not
+    // while a read is in flight: it cannot cancel an in-flight read, so the
+    // buffer the read owns cannot be rebuilt. An idle client therefore keeps its
+    // oversized buffer until it sends something again. Confirm it is retained
+    // past the idle threshold, then complete the command and confirm the next
+    // read opportunity reclaims the capacity.
+    std::thread::sleep(Duration::from_secs(3));
+    let line = {
+        let list = observer.cmd(&["CLIENT", "LIST"]);
+        client_list_line(&list, "name=uring-fat-qbuf")
+            .unwrap_or("")
+            .to_string()
+    };
+    assert!(
+        client_query_buffer_size(&line).is_some_and(|size| size > 1_000_000),
+        "an idle io_uring client must retain its oversized buffer until the next read: {line}"
+    );
+
+    // Finish the fat argument so the SET completes and the client is no longer
+    // mid-request.
+    let mut rest = vec![b'a'; 999_999];
+    rest.extend_from_slice(b"\r\n");
+    client.writer.write_all(&rest).unwrap();
+    assert_eq!(client.read(), s("OK"));
+
+    // The completed SET left the buffer at its full ~1 MB size; the reclaim
+    // happens on the *next* read opportunity that follows an idle period. Go
+    // idle, then send a small command to give the server that opportunity.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(client.cmd(&["PING"]), s("PONG"));
+
     let deadline = Instant::now() + Duration::from_secs(4);
     let line = loop {
         let list = observer.cmd(&["CLIENT", "LIST"]);
@@ -445,10 +501,9 @@ fn large_bulk_header_reserves_a_private_query_buffer() {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(client_metric(&line, "qbuf="), Some("31"), "{line}");
     assert!(
         client_query_buffer_size(&line).is_some_and(|size| size < 1_000_000),
-        "idle partial argument retained excess query-buffer capacity: {line}"
+        "the read opportunity after idle did not reclaim excess query-buffer capacity: {line}"
     );
 }
 

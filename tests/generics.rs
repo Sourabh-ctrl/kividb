@@ -208,6 +208,7 @@ fn start_server(port: u16) {
             aclfile: "".to_string(),
             slowlog_log_slower_than: 10_000,
             slowlog_max_len: 128,
+            query_buffer_idle_resize_after_ms: 150,
             cluster_enabled: false,
             cluster_node_timeout: 15000,
             configfile: "./kividb.conf".to_string(),
@@ -1118,6 +1119,21 @@ fn test_client_list_reports_partial_query_buffer() {
         client_list_field(&line, "qbuf-free="),
         Some("0"),
         "idle private query buffer was not released: {line}"
+    );
+
+    assert_eq!(partial.cmds(&["PING"]).as_str(), "PONG");
+    let line = observer
+        .cmds(&["CLIENT", "LIST"])
+        .as_str()
+        .lines()
+        .find(|line| line.contains("name=partial-query"))
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(client_list_field(&line, "qbuf="), Some("0"), "{line}");
+    assert_eq!(
+        client_list_field(&line, "qbuf-free="),
+        Some("0"),
+        "a released reusable buffer must not be marked private again: {line}"
     );
 }
 

@@ -169,7 +169,7 @@ Thirty-one tests, in three groups.
 | `info-keysizes` | 5 | the key-size histograms of `INFO keysizes` |
 | `lazyfree`, `functions` | 8 | the `lazyfreed_objects` and `lazyfree_pending_objects` counters, `used_memory_vm_functions`, and `FLUSHALL ASYNC` as a blocking background job. KiviDB frees in the command; the tests are of the counters |
 | `latency-monitor` | 2 | the `expire-cycle` latency event |
-| `querybuf` | 2 | `CLIENT LIST`'s `qbuf=` and `qbuf-free=` (reported as 0) |
+| `querybuf` | 2 | an idle client's query buffer is not shrunk from a background timer (see below) |
 
 **Redis's internal encodings (5).** `dump` (2): `RESTORE … IDLETIME` and
 `FREQ` are accepted and not applied. `type/hash` (2) and the one unit that
@@ -196,6 +196,26 @@ Redis's HyperLogLog header with `GETRANGE`.
 
 Expiry during a pause and the idle-time reset are the two of these worth
 fixing next: both are real differences an application could meet.
+
+### The query-buffer unit
+
+`unit/querybuf` writes a partial command, lets the client go idle, and waits
+for `CLIENT LIST`'s `qbuf` + `qbuf-free` to fall — Redis shrinks an idle
+client's oversized query buffer from its client cron, on a two-second idle
+timer. `qbuf` and `qbuf-free` are reported truthfully here (they were not,
+before), but the *io_uring* server never shrinks a buffer while a read is in
+flight, because the buffer a read owns cannot be rebuilt under it and the
+operation cannot be cancelled to force one. It reclaims an oversized private
+buffer at the next read opportunity instead: between batches, once the read
+that is in flight has completed and before the next one is submitted. An idle
+client therefore keeps its buffer until it sends something again, which is
+what the unit's two failures measure.
+
+The **Tokio** server does not have this limit — a Tokio read is cancellable,
+so a timer can shrink the buffer while the read waits — and it keeps Redis's
+idle-timer behaviour. Both servers keep an accurate `qbuf` / `qbuf-free`; the
+difference is when an idle oversized buffer is released, not whether it is.
+This is a deliberate trade for the io_uring read path, not a defect.
 
 ## The cost
 
