@@ -462,7 +462,14 @@ fn exec_fast_apply_sets(
 /// empty, rather than kept.
 const BIG_BUFFER: usize = 256 * 1024;
 
-const READ_BUFFER: usize = 16 * 1024;
+/// How much room a read is given at a time. Like Redis's `PROTO_IOBUF_LEN`,
+/// a fresh read asks for a full 32 KiB so a pipelined batch or a large bulk
+/// arrives in as few syscalls as possible; the buffer is only ever reserved
+/// in these units, so this is also the floor a reclaimed buffer returns to.
+const READ_BUFFER: usize = 32 * 1024;
+/// A read is only submitted when the buffer has at least this much spare
+/// capacity left. Below it, another `READ_BUFFER`-sized chunk is reserved
+/// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 
 #[allow(clippy::too_many_arguments)]
@@ -2380,6 +2387,18 @@ pub async fn handle_client(
         if parse_start == parse_buf.len() {
             parse_buf.clear();
             parse_start = 0;
+            // A buffer that grew to hold one large request is given back at the
+            // end of the batch that finished it, rather than kept at that size
+            // for the life of the connection. This is the batch boundary: the
+            // request has been parsed and answered, no read is in flight, and
+            // `parse_buf` is owned by this loop — so rebuilding it cannot
+            // invalidate a pending io_uring operation. It happens here even if
+            // the client then goes idle, which is what the idle-driven resize
+            // above cannot reach: that one only runs after the *next* read.
+            if parse_buf.capacity() > BIG_BUFFER {
+                parse_buf = Vec::with_capacity(READ_BUFFER);
+                query_buffer_peak = 0;
+            }
         } else if parse_start > 0 && parse_start > parse_buf.len() / 2 {
             let remaining = parse_buf.len() - parse_start;
             parse_buf.copy_within(parse_start.., 0);
