@@ -169,7 +169,7 @@ Thirty-one tests, in three groups.
 | `info-keysizes` | 5 | the key-size histograms of `INFO keysizes` |
 | `lazyfree`, `functions` | 8 | the `lazyfreed_objects` and `lazyfree_pending_objects` counters, `used_memory_vm_functions`, and `FLUSHALL ASYNC` as a blocking background job. KiviDB frees in the command; the tests are of the counters |
 | `latency-monitor` | 2 | the `expire-cycle` latency event |
-| `querybuf` | 2 | an idle client's query buffer is not shrunk from a background timer (see below) |
+| `querybuf` | 2 | `CLIENT LIST` does not report `idle=` (`idle=0` always), so the unit's idle-wait never satisfies — and on io_uring the idle shrink also has no timer (see below). The second failure is a knock-on of the first, not a separate gap |
 
 **Redis's internal encodings (5).** `dump` (2): `RESTORE … IDLETIME` and
 `FREQ` are accepted and not applied. `type/hash` (2) and the one unit that
@@ -199,23 +199,36 @@ fixing next: both are real differences an application could meet.
 
 ### The query-buffer unit
 
-`unit/querybuf` writes a partial command, lets the client go idle, and waits
-for `CLIENT LIST`'s `qbuf` + `qbuf-free` to fall — Redis shrinks an idle
-client's oversized query buffer from its client cron, on a two-second idle
-timer. `qbuf` and `qbuf-free` are reported truthfully here (they were not,
-before), but the *io_uring* server never shrinks a buffer while a read is in
-flight, because the buffer a read owns cannot be rebuilt under it and the
-operation cannot be cancelled to force one. It reclaims an oversized private
-buffer at the next read opportunity instead: between batches, once the read
-that is in flight has completed and before the next one is submitted. An idle
-client therefore keeps its buffer until it sends something again, which is
-what the unit's two failures measure.
+Two tests fail here, and they have different causes. Neither is the
+query-buffer sizing this change adds: `qbuf` and `qbuf-free` are reported
+truthfully, and a declared fat argument reserves correctly.
 
-The **Tokio** server does not have this limit — a Tokio read is cancellable,
-so a timer can shrink the buffer while the read waits — and it keeps Redis's
-idle-timer behaviour. Both servers keep an accurate `qbuf` / `qbuf-free`; the
-difference is when an idle oversized buffer is released, not whether it is.
-This is a deliberate trade for the io_uring read path, not a defect.
+**`query buffer resized correctly`** writes a partial command, lets the client
+go idle, and waits on `[client_idle_sec test_client] >= 3` — the run of an idle
+client Redis measures with its client cron. KiviDB reports `idle=0` in
+`CLIENT LIST` (it does not yet track per-client idle time), so that condition
+never becomes true and the test cannot reach the shrink it is looking for. The
+immediate, shared cause is therefore the missing `idle=` reporting; it fails
+identically on **both** Tokio and io_uring. The io_uring implementation has a
+further limitation on top of it: it also has no timer to shrink an idle
+buffer, because it cannot rebuild a buffer a read owns and will not cancel the
+read to force one. The `idle=` fix is out of scope here and belongs in a
+separate PR; once `idle=` is corrected, this test is expected to pass on
+**Tokio** (its read is cancellable, so a timer can shrink the buffer while the
+read waits). That is an expectation from reading the test and the code, not a
+result we have measured.
+
+**`query buffer resized correctly with fat argv`** sends the fat-argument
+request on `$rd`, a separate `redis_client` connection, and runs `CLIENT LIST`
+on `r`. It looks up the buffer with `client_query_buffer test_client`, which
+takes the first `test_client` line from `CLIENT LIST`. The preceding test is
+what fails first, and it fails *before* its `$rd close`, so its `test_client`
+connection is still connected when this test runs — and its entry comes first.
+`client_query_buffer` therefore reads the stale connection's entry, whose
+`qbuf`/`qbuf-free` never grew, and the fat-argv assertion fails. This is a
+knock-on of the first test failing, not a same-connection protocol effect and
+not evidence that fat-argument reservation is broken (an isolated probe, and
+the in-tree Rust test, show the reservation working).
 
 ## The cost
 

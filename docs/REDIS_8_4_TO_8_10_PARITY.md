@@ -183,15 +183,21 @@ does.
   `--tls-port`.
 * In cluster mode a `MULTI` is routed as its commands are queued and must
   address one slot.
-* **An idle client's oversized query buffer is released later under
-  io_uring.** `CLIENT LIST`'s `qbuf` and `qbuf-free` are reported truthfully
-  on both servers, but the io_uring server does not shrink an idle buffer from
-  a background timer: it cannot rebuild a buffer a read owns, and it will not
-  cancel the read to force one, so it reclaims the buffer at the client's next
-  read instead. Redis — and KiviDB's own Tokio server, whose reads are
-  cancellable — shrink it from a two-second idle timer. The buffer is still
-  released, only later; see `docs/REDIS_TEST_SUITE.md` and the `unit/querybuf`
-  failures.
+* **`CLIENT LIST` does not report `idle=`.** `qbuf` and `qbuf-free` are
+  reported truthfully on both servers, but an idle client's `idle` is always
+  `0`, and the server has no background shrink of an idle oversized query
+  buffer. Redis shrinks it from its client cron on a two-second idle timer.
+  This is what the `unit/querybuf` tests wait on (`[client_idle_sec …] >= 3`);
+  because `idle=` is never reported, the wait never satisfies, and the first
+  test fails on **both** Tokio and io_uring. The io_uring path has the further
+  constraint that it cannot rebuild a buffer a read owns and will not cancel
+  the read to force one, so it has no timer to shrink from even once `idle=` is
+  reported; Tokio, whose reads are cancellable, is expected to pass that test
+  once `idle=` is corrected (not yet measured). The second `querybuf` failure,
+  `… with fat argv`, is a knock-on of the first — the first test fails before
+  closing its `test_client`, and `client_query_buffer` then reads that stale
+  entry — not a missing feature. The `idle=` fix is a separate change; see
+  `docs/REDIS_TEST_SUITE.md`.
 
 ## Fixed along the way
 
