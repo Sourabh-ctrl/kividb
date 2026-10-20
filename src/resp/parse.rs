@@ -176,10 +176,10 @@ fn parse_multibulk<'a>(
             .filter(|len| (0..=BULK_MAX).contains(len))
             .ok_or("invalid bulk length")? as usize;
         idx = line_end + 2;
-        if len >= BIG_ARG {
-            if let Some(progress) = progress.as_deref_mut() {
-                progress.large_bulk(len + 2);
-            }
+        if len >= BIG_ARG
+            && let Some(progress) = progress.as_deref_mut()
+        {
+            progress.large_bulk(len + 2);
         }
         if idx + len + 2 > buf.len() {
             if let Some(progress) = progress.as_deref_mut() {
@@ -381,7 +381,7 @@ impl Progress {
             if request.is_some() {
                 self.clear_request_scan();
             }
-            return Ok(request);
+            Ok(request)
         } else {
             let has_request_bytes = at < buf.len();
             let request = next_request(buf, at);
