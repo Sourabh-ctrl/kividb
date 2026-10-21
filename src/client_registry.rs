@@ -12,6 +12,16 @@ pub fn next_client_id() -> u64 {
     NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A monotonic clock the whole process shares, started at first use. Idle
+/// time is measured against it, not the wall clock, so `idle=` cannot jump
+/// when the system clock is set back or forwards.
+static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Whole seconds since the process's monotonic epoch. Non-decreasing.
+fn now_seconds() -> u64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 /// A handle the server loop holds to detect a CLIENT KILL.
 /// When the kill command fires, the Receiver resolves and the loop breaks.
 pub type KillRx = oneshot::Receiver<()>;
@@ -29,6 +39,11 @@ pub type KillRx = oneshot::Receiver<()>;
 pub struct Activity {
     /// The command's name, as sent, cut to 24 bytes.
     name: [AtomicU64; 3],
+    /// When the connection last interacted, in seconds on the monotonic
+    /// clock [`now_seconds`] reads. Written on every command, read to print
+    /// `idle=`. Nothing else reads it, so a torn view between the two is a
+    /// second of error on that one field and nothing more.
+    last_interaction: AtomicU64,
     /// Its first argument, if that is of 16 bytes or fewer: the subcommand,
     /// if the command has them.
     sub: [AtomicU64; 2],
@@ -308,8 +323,37 @@ impl Activity {
         self.db.load(Ordering::Relaxed)
     }
 
+    /// Note that the connection has just interacted, so `idle=` restarts
+    /// from now. One relaxed store; called once per command.
+    #[inline]
+    pub fn touch(&self) {
+        self.last_interaction
+            .store(now_seconds(), Ordering::Relaxed);
+    }
+
+    /// Whole seconds since the connection last interacted: what Redis prints
+    /// as `idle=`. Reading it does not touch the connection, so `CLIENT LIST`
+    /// leaves every listed client's idle timer where it was.
+    pub fn idle_seconds(&self) -> u64 {
+        self.idle_seconds_at(now_seconds())
+    }
+
+    /// [`idle_seconds`](Self::idle_seconds) for a given clock reading, so the
+    /// elapsed-time arithmetic can be checked without waiting on a clock.
+    fn idle_seconds_at(&self, now: u64) -> u64 {
+        now.saturating_sub(self.last_interaction.load(Ordering::Relaxed))
+    }
+
+    /// The monotonic reading this activity last recorded, for tests and for
+    /// anyone reasoning about the clock directly.
+    #[cfg(test)]
+    fn interaction_at(&self) -> u64 {
+        self.last_interaction.load(Ordering::Relaxed)
+    }
+
     #[inline]
     pub fn record(&self, cmd: &[&[u8]], db: usize) {
+        self.touch();
         self.db.store(db, Ordering::Relaxed);
         let name = pack(cmd[0], &self.name);
         // An argument too long to be the name of a subcommand is a key, or
@@ -402,6 +446,8 @@ impl ClientInfo {
     /// connection loop to select on.
     pub fn new(id: u64, addr: String) -> (Self, KillRx) {
         let (kill_tx, kill_rx) = oneshot::channel();
+        let activity = Activity::default();
+        activity.touch();
         let info = Self {
             id,
             addr,
@@ -411,7 +457,7 @@ impl ClientInfo {
             db: 0,
             flags: "N".to_string(),
             connected_at: Instant::now(),
-            activity: Arc::default(),
+            activity: Arc::new(activity),
             query_buffer: Arc::default(),
             no_evict: false,
             asking: false,
@@ -455,6 +501,7 @@ impl ClientInfo {
     /// Redis-specific buffer and memory counters remain zero.
     pub fn to_list_line(&self) -> String {
         let age = self.connected_at.elapsed().as_secs();
+        let idle = self.activity.idle_seconds();
         let (qbuf, qbuf_free) = self.query_buffer.values();
         let mut flags = String::new();
         if self.flags != "N" {
@@ -470,7 +517,7 @@ impl ClientInfo {
             flags.push('N');
         }
         format!(
-            "id={} addr={} laddr={} fd=0 name={} age={} idle=0 flags={} db={} sub={} psub={} \
+            "id={} addr={} laddr={} fd=0 name={} age={} idle={} flags={} db={} sub={} psub={} \
             ssub={} multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=0 multi-mem=0 \
             rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} \
             user={} redir={} resp={} lib-name={} lib-ver={} io-thread=0\n",
@@ -479,6 +526,7 @@ impl ClientInfo {
             self.laddr,
             self.name,
             age,
+            idle,
             flags,
             self.activity.db(),
             self.subscriptions[0],
@@ -844,5 +892,67 @@ mod tests {
             "client|abcdefghijklmnop"
         );
         assert_eq!(after(&[&["CLIENT", "ABCDEFGHIJKLMNOPQ"]]), "client");
+    }
+
+    /// A client that has just been created is idle only for the instant since.
+    #[test]
+    fn a_new_client_has_hardly_been_idle() {
+        let activity = Activity::default();
+        activity.touch();
+        assert!(activity.idle_seconds() <= 1);
+    }
+
+    /// Idle time is the gap between the last interaction and now, and it
+    /// grows as that gap widens.
+    #[test]
+    fn idle_time_grows_with_the_clock() {
+        let activity = Activity::default();
+        activity.touch();
+        let at = activity.interaction_at();
+        assert_eq!(activity.idle_seconds_at(at), 0);
+        assert_eq!(activity.idle_seconds_at(at + 5), 5);
+        assert_eq!(activity.idle_seconds_at(at + 30), 30);
+    }
+
+    /// An interaction from now clears the idle time.
+    #[test]
+    fn interacting_resets_the_idle_clock() {
+        let activity = Activity::default();
+        activity.touch();
+        let at = activity.interaction_at();
+        assert_eq!(activity.idle_seconds_at(at + 42), 42);
+        // A later interaction moves the recorded point to that later time.
+        activity.last_interaction.store(at + 42, Ordering::Relaxed);
+        assert_eq!(activity.idle_seconds_at(at + 42), 0);
+        assert_eq!(activity.idle_seconds_at(at + 45), 3);
+    }
+
+    /// Reading the idle time does not itself count as an interaction, so a
+    /// `CLIENT LIST` of a client leaves its timer running.
+    #[test]
+    fn reading_the_idle_time_does_not_reset_it() {
+        let activity = Activity::default();
+        activity.touch();
+        let at = activity.interaction_at();
+        // Several reads at the same clock reading keep the same interaction
+        // point, so the reported idle never falls back to zero by being read.
+        assert_eq!(activity.interaction_at(), at);
+        assert_eq!(activity.idle_seconds_at(at + 7), 7);
+        assert_eq!(activity.interaction_at(), at);
+        assert_eq!(activity.idle_seconds_at(at + 7), 7);
+        assert_eq!(activity.interaction_at(), at);
+    }
+
+    /// A command is an interaction, so running one restarts the idle clock.
+    #[test]
+    fn a_command_resets_the_idle_clock() {
+        let activity = Activity::default();
+        activity.touch();
+        let before = activity.interaction_at();
+        assert_eq!(activity.idle_seconds_at(before + 20), 20);
+        activity.record(&[b"PING"], 0);
+        let after = activity.interaction_at();
+        assert!(after >= before);
+        assert_eq!(activity.idle_seconds_at(after), 0);
     }
 }
