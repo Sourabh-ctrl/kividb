@@ -40,9 +40,10 @@ pub struct Activity {
     /// The command's name, as sent, cut to 24 bytes.
     name: [AtomicU64; 3],
     /// When the connection last interacted, in seconds on the monotonic
-    /// clock [`now_seconds`] reads. Written on every command, read to print
-    /// `idle=`. Nothing else reads it, so a torn view between the two is a
-    /// second of error on that one field and nothing more.
+    /// clock [`now_seconds`] reads. Written once per socket read — see
+    /// [`touch`](Activity::touch) — and read to print `idle=`. Nothing else
+    /// reads it, so a torn view between the two is a second of error on that
+    /// one field and nothing more.
     last_interaction: AtomicU64,
     /// Its first argument, if that is of 16 bytes or fewer: the subcommand,
     /// if the command has them.
@@ -324,7 +325,13 @@ impl Activity {
     }
 
     /// Note that the connection has just interacted, so `idle=` restarts
-    /// from now. One relaxed store; called once per command.
+    /// from now. One relaxed store.
+    ///
+    /// Called once per socket read by the connection loop — not once per
+    /// command — so a pipeline of many commands that arrives in a single read
+    /// pays for one clock reading, and a client that is idle between reads
+    /// keeps the idle time it has built up. Reading client information does
+    /// not touch, so `CLIENT LIST` leaves every listed client's timer alone.
     #[inline]
     pub fn touch(&self) {
         self.last_interaction
@@ -353,7 +360,6 @@ impl Activity {
 
     #[inline]
     pub fn record(&self, cmd: &[&[u8]], db: usize) {
-        self.touch();
         self.db.store(db, Ordering::Relaxed);
         let name = pack(cmd[0], &self.name);
         // An argument too long to be the name of a subcommand is a key, or
@@ -943,16 +949,27 @@ mod tests {
         assert_eq!(activity.interaction_at(), at);
     }
 
-    /// A command is an interaction, so running one restarts the idle clock.
+    /// A socket read is the interaction: `touch` restarts the idle clock.
+    /// `record` — the per-command bookkeeping — must not, so a pipeline of
+    /// commands that arrived in one read does not keep pushing the clock.
     #[test]
-    fn a_command_resets_the_idle_clock() {
+    fn a_socket_read_resets_the_idle_clock_but_a_command_does_not() {
         let activity = Activity::default();
         activity.touch();
-        let before = activity.interaction_at();
-        assert_eq!(activity.idle_seconds_at(before + 20), 20);
+        let read_at = activity.interaction_at();
+        assert_eq!(activity.idle_seconds_at(read_at + 20), 20);
+
+        // Commands arrive from one read: recording them leaves the clock alone.
         activity.record(&[b"PING"], 0);
-        let after = activity.interaction_at();
-        assert!(after >= before);
-        assert_eq!(activity.idle_seconds_at(after), 0);
+        activity.record(&[b"GET", b"k"], 0);
+        assert_eq!(activity.interaction_at(), read_at);
+        assert_eq!(activity.idle_seconds_at(read_at + 20), 20);
+
+        // The next socket read is the interaction, and it restarts the clock.
+        activity
+            .last_interaction
+            .store(read_at + 20, Ordering::Relaxed);
+        assert_eq!(activity.idle_seconds_at(read_at + 20), 0);
+        assert_eq!(activity.idle_seconds_at(read_at + 23), 3);
     }
 }
